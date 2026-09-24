@@ -15,41 +15,69 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
+      # ---------------------------------------------------------
+      # Android SDK
+      # ---------------------------------------------------------
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          packages: ''
 
       - name: Install Android NDK
+        shell: bash
         run: |
-          sdkmanager "platform-tools" \
+          sdkmanager --install \
+            "platform-tools" \
             "platforms;android-24" \
             "build-tools;35.0.0" \
             "ndk;27.2.12479018"
 
-      - name: Install AArch64 tools
+      # ---------------------------------------------------------
+      # Host tools for Halogen's verbatim network converter
+      # ---------------------------------------------------------
+      - name: Install AArch64 Linux compiler and QEMU
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             g++-aarch64-linux-gnu \
             qemu-user-static
 
+      # ---------------------------------------------------------
+      # Android compiler
+      # ---------------------------------------------------------
       - name: Configure Android toolchain
         shell: bash
         run: |
           echo "ANDROID_NDK=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
           echo "ANDROID_CLANG=$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++" >> "$GITHUB_ENV"
 
+      # ---------------------------------------------------------
+      # Download Halogen NNUE
+      # ---------------------------------------------------------
       - name: Download Halogen network
+        shell: bash
         run: |
           mkdir -p build
+
           curl -fL \
             "https://github.com/KierenP/Halogen-Networks/releases/download/ed164cf2/ed164cf2.nn" \
             -o build/ed164cf2.nn
 
           ls -lh build/ed164cf2.nn
 
-      - name: Build ARM64 network tool
+      # ---------------------------------------------------------
+      # Build Halogen's verbatim tool for Linux AArch64
+      #
+      # IMPORTANT:
+      # This is NOT the Android engine.
+      #
+      # Halogen uses this executable to convert the NNUE into
+      # the SIMD-specific layout before embedding it.
+      # ---------------------------------------------------------
+      - name: Build ARM64 verbatim tool
         working-directory: src
         shell: bash
         run: |
@@ -59,17 +87,20 @@ jobs:
             -O3 \
             -std=c++20 \
             -fno-exceptions \
-            -pthread \
             -I. \
             -DUSE_NEON \
             -DUSE_NEON_DOTPROD \
             -march=armv8.2-a+dotprod \
             tools/verbatim.cpp \
             -o ../build/neon-dotprod/verbatim \
+            -pthread \
             -lm
 
           file ../build/neon-dotprod/verbatim
 
+      # ---------------------------------------------------------
+      # Generate architecture-specific NNUE
+      # ---------------------------------------------------------
       - name: Generate NEON DotProd network
         working-directory: src
         shell: bash
@@ -84,6 +115,24 @@ jobs:
 
           ls -lh ../build/neon-dotprod/verbatim.nn
 
+      # ---------------------------------------------------------
+      # Prepare Makefile flags
+      #
+      # We provide the already-generated verbatim executable and
+      # network so Make does NOT try to execute an Android binary.
+      # ---------------------------------------------------------
+      - name: Prepare Halogen build directory
+        shell: bash
+        run: |
+          mkdir -p build/neon-dotprod
+          mkdir -p bin
+
+          touch build/neon-dotprod/verbatim
+          touch build/neon-dotprod/verbatim.nn
+
+      # ---------------------------------------------------------
+      # Build Android Halogen
+      # ---------------------------------------------------------
       - name: Build Android engine
         working-directory: src
         shell: bash
@@ -92,12 +141,17 @@ jobs:
             ARCH=neon-dotprod \
             CXX="$ANDROID_CLANG" \
             EVALFILE="../build/ed164cf2.nn" \
+            VERBATIM="../build/neon-dotprod/verbatim" \
+            VERBATIM_NET="../build/neon-dotprod/verbatim.nn" \
             EXTRA_CXXFLAGS="-mcpu=cortex-a76" \
             EXTRA_LDFLAGS="-static-libstdc++" \
             EXE=../bin/Halogen-Android \
             -j"$(nproc)"
 
-      - name: Verify binary
+      # ---------------------------------------------------------
+      # Verify binary
+      # ---------------------------------------------------------
+      - name: Verify Android binary
         shell: bash
         run: |
           file bin/Halogen-Android
@@ -107,6 +161,9 @@ jobs:
 
           ls -lh bin/Halogen-Android
 
+      # ---------------------------------------------------------
+      # Upload
+      # ---------------------------------------------------------
       - name: Upload Android engine
         uses: actions/upload-artifact@v4
         with:
