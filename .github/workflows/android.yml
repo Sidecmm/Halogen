@@ -35,17 +35,7 @@ jobs:
             "ndk;27.2.12479018"
 
       # ---------------------------------------------------------
-      # Host tools for Halogen's verbatim network converter
-      # ---------------------------------------------------------
-      - name: Install AArch64 Linux compiler and QEMU
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            g++-aarch64-linux-gnu \
-            qemu-user-static
-
-      # ---------------------------------------------------------
-      # Android compiler
+      # Configure Android compiler
       # ---------------------------------------------------------
       - name: Configure Android toolchain
         shell: bash
@@ -55,7 +45,7 @@ jobs:
           echo "ANDROID_CLANG=$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++" >> "$GITHUB_ENV"
 
       # ---------------------------------------------------------
-      # Download Halogen NNUE
+      # Download Halogen network
       # ---------------------------------------------------------
       - name: Download Halogen network
         shell: bash
@@ -69,28 +59,30 @@ jobs:
           ls -lh build/ed164cf2.nn
 
       # ---------------------------------------------------------
-      # Build Halogen's verbatim tool for Linux AArch64
+      # Build Halogen's VERBATIM tool on the HOST.
       #
       # IMPORTANT:
-      # This is NOT the Android engine.
+      # verbatim.cpp does not execute NEON instructions.
+      # It only needs the target SIMD layout.
       #
-      # Halogen uses this executable to convert the NNUE into
-      # the SIMD-specific layout before embedding it.
+      # USE_NEON gives:
+      #   SIMD::vec_size = 16
+      #
+      # Therefore QEMU is unnecessary.
       # ---------------------------------------------------------
-      - name: Build ARM64 verbatim tool
+      - name: Build NEON network preprocessing tool
         working-directory: src
         shell: bash
         run: |
           mkdir -p ../build/neon-dotprod
 
-          aarch64-linux-gnu-g++ \
+          g++ \
             -O3 \
             -std=c++20 \
             -fno-exceptions \
             -I. \
             -DUSE_NEON \
             -DUSE_NEON_DOTPROD \
-            -march=armv8.2-a+dotprod \
             tools/verbatim.cpp \
             -o ../build/neon-dotprod/verbatim \
             -pthread \
@@ -99,7 +91,7 @@ jobs:
           file ../build/neon-dotprod/verbatim
 
       # ---------------------------------------------------------
-      # Generate architecture-specific NNUE
+      # Generate the NEON/DotProd-specific NNUE file
       # ---------------------------------------------------------
       - name: Generate NEON DotProd network
         working-directory: src
@@ -107,31 +99,21 @@ jobs:
         run: |
           chmod +x ../build/neon-dotprod/verbatim
 
-          qemu-aarch64 \
-            -L /usr/aarch64-linux-gnu \
-            ../build/neon-dotprod/verbatim \
+          ../build/neon-dotprod/verbatim \
             ../build/ed164cf2.nn \
             ../build/neon-dotprod/verbatim.nn
 
           ls -lh ../build/neon-dotprod/verbatim.nn
 
       # ---------------------------------------------------------
-      # Prepare Makefile flags
+      # Build Android engine
       #
-      # We provide the already-generated verbatim executable and
-      # network so Make does NOT try to execute an Android binary.
-      # ---------------------------------------------------------
-      - name: Prepare Halogen build directory
-        shell: bash
-        run: |
-          mkdir -p build/neon-dotprod
-          mkdir -p bin
-
-          touch build/neon-dotprod/verbatim
-          touch build/neon-dotprod/verbatim.nn
-
-      # ---------------------------------------------------------
-      # Build Android Halogen
+      # Halogen's Makefile supplies:
+      #   -O3
+      #   -flto
+      #   -DUSE_NEON
+      #   -DUSE_NEON_DOTPROD
+      #   -march=armv8.2-a+dotprod
       # ---------------------------------------------------------
       - name: Build Android engine
         working-directory: src
@@ -141,15 +123,13 @@ jobs:
             ARCH=neon-dotprod \
             CXX="$ANDROID_CLANG" \
             EVALFILE="../build/ed164cf2.nn" \
-            VERBATIM="../build/neon-dotprod/verbatim" \
-            VERBATIM_NET="../build/neon-dotprod/verbatim.nn" \
             EXTRA_CXXFLAGS="-mcpu=cortex-a76" \
             EXTRA_LDFLAGS="-static-libstdc++" \
             EXE=../bin/Halogen-Android \
             -j"$(nproc)"
 
       # ---------------------------------------------------------
-      # Verify binary
+      # Verify
       # ---------------------------------------------------------
       - name: Verify Android binary
         shell: bash
