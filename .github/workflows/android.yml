@@ -47,8 +47,7 @@ jobs:
       # ============================================================
       # HOST AARCH64 COMPILER + QEMU
       #
-      # These are ONLY used for Halogen's verbatim network
-      # preprocessing tool.
+      # Used for the Halogen verbatim network preprocessing tool.
       # ============================================================
 
       - name: Install AArch64 compiler and QEMU
@@ -82,7 +81,7 @@ jobs:
 
 
       # ============================================================
-      # DOWNLOAD NNUE
+      # DOWNLOAD HALOGEN NETWORK
       # ============================================================
 
       - name: Download Halogen network
@@ -94,7 +93,7 @@ jobs:
             "https://github.com/KierenP/Halogen-Networks/releases/download/ed164cf2/ed164cf2.nn" \
             -o build/ed164cf2.nn
 
-          echo "Network:"
+          echo "Downloaded network:"
           ls -lh build/ed164cf2.nn
 
 
@@ -111,6 +110,9 @@ jobs:
 
       # ============================================================
       # ANDROID MEMORY ALLOCATION FIX
+      #
+      # std::aligned_alloc is not usable with this Android NDK/API
+      # combination, so Android uses posix_memalign instead.
       # ============================================================
 
       - name: Patch Android memory allocation
@@ -153,11 +155,11 @@ jobs:
               print("Patched std::aligned_alloc for Android.")
 
           elif "posix_memalign(&aligned_ptr" in text:
-              print("Android allocation patch already exists.")
+              print("Android allocation patch already present.")
 
           else:
               raise SystemExit(
-                  "ERROR: Could not find std::aligned_alloc line "
+                  "ERROR: Could not find std::aligned_alloc "
                   "in utility/huge_pages.h"
               )
 
@@ -172,14 +174,13 @@ jobs:
 
 
       # ============================================================
-      # BUILD VERBATIM FOR LINUX AARCH64
+      # BUILD LINUX AARCH64 VERBATIM
       #
       # IMPORTANT:
       #
-      # DO NOT use Android clang here.
+      # This is NOT the final Android engine.
       #
-      # Halogen's verbatim program must be executable on the
-      # GitHub Linux runner, so we build a Linux AArch64 ELF.
+      # It is the ARM64 Linux helper used to generate verbatim.nn.
       # ============================================================
 
       - name: Build ARM64 Linux verbatim
@@ -187,6 +188,7 @@ jobs:
         shell: bash
         run: |
           rm -f ../build/neon-dotprod/verbatim
+          rm -f ../build/neon-dotprod/verbatim.nn
 
           aarch64-linux-gnu-g++ \
             -O3 \
@@ -203,132 +205,112 @@ jobs:
 
           chmod +x ../build/neon-dotprod/verbatim
 
-          echo "----- verbatim -----"
+          echo "----- Linux ARM64 verbatim -----"
 
           file ../build/neon-dotprod/verbatim
 
 
       # ============================================================
-      # RUN VERBATIM THROUGH QEMU
+      # GENERATE ARCHITECTURE-SPECIFIC NETWORK
+      #
+      # Run the Linux ARM64 helper under QEMU.
       # ============================================================
 
       - name: Generate NEON DotProd network
         working-directory: src
         shell: bash
         run: |
-          rm -f ../build/neon-dotprod/verbatim.nn
-
           qemu-aarch64-static \
             -L /usr/aarch64-linux-gnu \
             ../build/neon-dotprod/verbatim \
             ../build/ed164cf2.nn \
             ../build/neon-dotprod/verbatim.nn
 
-          echo "----- generated verbatim.nn -----"
+          echo "----- Generated network -----"
 
           ls -lh ../build/neon-dotprod/verbatim.nn
 
 
       # ============================================================
-      # PREVENT MAKE FROM REBUILDING / RUNNING VERBATIM
-      #
-      # The normal Halogen Makefile tries to compile verbatim using
-      # CXX and then executes it.
-      #
-      # CXX will later be Android clang++, which would create an
-      # Android executable requiring /system/bin/linker64.
-      #
-      # We therefore modify the Makefile's verbatim command so the
-      # already-generated ARM64 network is retained.
+      # VERIFY NETWORK
       # ============================================================
 
-      - name: Disable Makefile verbatim regeneration
+      - name: Verify generated network
+        shell: bash
+        run: |
+          test -s build/neon-dotprod/verbatim.nn
+
+          echo "verbatim.nn exists and is non-empty."
+
+          ls -lh build/neon-dotprod/verbatim.nn
+
+
+      # ============================================================
+      # PATCH HALOGEN MAKEFILE
+      #
+      # The original Makefile contains:
+      #
+      # $(VERBATIM_NET): $(VERBATIM) $(EVALFILE) $(FLAGS_STAMP)
+      #     ./$(VERBATIM) $(EVALFILE) $@
+      #
+      # That causes make release to build an Android verbatim
+      # executable and then try to execute it on the Linux runner.
+      #
+      # We already generated the correct ARM64 verbatim.nn above.
+      #
+      # Replace that rule with a simple existence check.
+      # ============================================================
+
+      - name: Disable automatic verbatim regeneration
         shell: bash
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          import re
 
           path = Path("src/Makefile")
           text = path.read_text()
 
-          print("Searching Makefile for verbatim rules...")
+          old = """$(VERBATIM_NET): $(VERBATIM) $(EVALFILE) $(FLAGS_STAMP)
+\t./$(VERBATIM) $(EVALFILE) $@"""
 
-          lines = text.splitlines()
+          new = """$(VERBATIM_NET):
+\t@test -s $@ || (echo "ERROR: pre-generated verbatim.nn is missing."; exit 1)
+\t@echo "Using pre-generated $@""""
 
-          for i, line in enumerate(lines):
-              if "verbatim.cpp" in line or "verbatim.nn" in line:
-                  start = max(0, i - 3)
-                  end = min(len(lines), i + 8)
-
-                  print()
-                  print("----- Makefile context -----")
-
-                  for n in range(start, end):
-                      print(f"{n + 1}: {lines[n]}")
-
-          # --------------------------------------------------------
-          # Replace direct execution of the generated verbatim
-          # program with a no-op.
-          #
-          # This catches the exact command that previously appeared:
-          #
-          # ./../build/neon-dotprod/verbatim ...
-          # --------------------------------------------------------
-
-          pattern = r'^(\s*)\./\.\./build/\$\(ARCH\)/verbatim\s+.*$'
-
-          new_lines = []
-
-          changed = False
-
-          for line in lines:
-              if re.match(pattern, line):
-                  indent = re.match(pattern, line).group(1)
-
-                  new_lines.append(
-                      indent
-                      + '@echo "Using pre-generated verbatim.nn; skipping host execution."'
-                  )
-
-                  changed = True
-              else:
-                  new_lines.append(line)
-
-          text = "\n".join(new_lines) + "\n"
-
-          if changed:
+          if old in text:
+              text = text.replace(old, new, 1)
               path.write_text(text)
-              print()
-              print("Patched Makefile: verbatim execution disabled.")
+              print("SUCCESS: Makefile verbatim generation disabled.")
+          elif "Using pre-generated $@" in text:
+              print("Makefile patch already present.")
           else:
-              print()
-              print("No direct ARCH verbatim execution line matched.")
-              print("The build will be inspected before continuing.")
-
+              raise SystemExit(
+                  "ERROR: Could not find the expected VERBATIM_NET rule "
+                  "in src/Makefile."
+              )
           PY
 
-          echo "----- Relevant Makefile lines -----"
+          echo
+          echo "----- Patched Makefile network section -----"
 
-          grep -n -A8 -B5 \
-            "verbatim.cpp\|verbatim.nn\|verbatim" \
-            src/Makefile || true
+          sed -n '340,365p' src/Makefile
 
 
       # ============================================================
-      # BUILD ANDROID ENGINE
+      # BUILD FINAL ANDROID ENGINE
       #
-      # NOW CXX IS ANDROID CLANG.
+      # This is the REAL engine.
       #
-      # The verbatim program is NOT supposed to execute anymore.
+      # ARCH:
+      #   neon-dotprod
       #
-      # Final target:
-      #   Android ARM64
-      #   NEON
-      #   DotProd
+      # CPU:
       #   Cortex-A76
-      #   O3
-      #   LTO
+      #
+      # Optimizations:
+      #   -O3
+      #   -flto
+      #   ARMv8.2-A DotProd
       # ============================================================
 
       - name: Build Android engine
@@ -338,7 +320,7 @@ jobs:
           make release \
             ARCH=neon-dotprod \
             CXX="$ANDROID_CLANG" \
-            EVALFILE="../build/neon-dotprod/verbatim.nn" \
+            EVALFILE="../build/ed164cf2.nn" \
             EXTRA_CXXFLAGS="-mcpu=cortex-a76" \
             EXTRA_LDFLAGS="-static-libstdc++" \
             EXE=../bin/Halogen-Android \
@@ -346,30 +328,26 @@ jobs:
 
 
       # ============================================================
-      # VERIFY FINAL ANDROID BINARY
+      # VERIFY FINAL BINARY
       # ============================================================
 
       - name: Verify Android binary
         shell: bash
         run: |
           echo "========================================"
-          echo "ANDROID BINARY"
+          echo "Halogen Android ARM64"
           echo "========================================"
 
           file bin/Halogen-Android
 
           echo
-          echo "========================================"
-          echo "ELF HEADER"
-          echo "========================================"
+          echo "----- ELF header -----"
 
           readelf -h bin/Halogen-Android | grep -E \
             "Class:|Machine:|Type:"
 
           echo
-          echo "========================================"
-          echo "BINARY SIZE"
-          echo "========================================"
+          echo "----- Binary size -----"
 
           ls -lh bin/Halogen-Android
 
