@@ -1,0 +1,187 @@
+name: Android ARM64
+
+on:
+workflow_dispatch:
+push:
+branches:
+- master
+pull_request:
+
+jobs:
+android-arm64:
+name: Android ARM64 NEON DotProd
+runs-on: ubuntu-24.04
+timeout-minutes: 30
+
+steps:
+  - name: Checkout
+    uses: actions/checkout@v5
+
+  # ------------------------------------------------------------
+  # Android NDK
+  # ------------------------------------------------------------
+  - name: Setup Android SDK and NDK
+    uses: android-actions/setup-android@v3
+
+  - name: Install Android NDK
+    run: |
+      sdkmanager "platform-tools" "platforms;android-24" "build-tools;35.0.0" "ndk;27.2.12479018"
+
+  # ------------------------------------------------------------
+  # ARM64 Linux tools
+  #
+  # Halogen's verbatim tool must run after being compiled for
+  # the target SIMD layout. We therefore build that small tool
+  # as Linux AArch64 and execute it through QEMU.
+  # ------------------------------------------------------------
+  - name: Install AArch64 Linux compiler and QEMU
+    run: |
+      sudo apt-get update
+      sudo apt-get install -y \
+        g++-aarch64-linux-gnu \
+        qemu-user-static
+
+  # ------------------------------------------------------------
+  # Prepare the Android compiler
+  # ------------------------------------------------------------
+  - name: Configure Android toolchain
+    shell: bash
+    run: |
+      echo "ANDROID_NDK=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+      echo "ANDROID_CLANG=$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++" >> "$GITHUB_ENV"
+
+  # ------------------------------------------------------------
+  # Download the network.
+  #
+  # This is the same default network selected by Halogen's
+  # Makefile: ed164cf2.nn
+  # ------------------------------------------------------------
+  - name: Download Halogen network
+    working-directory: src
+    run: |
+      mkdir -p ../build/neon-dotprod
+
+      curl -fL \
+        "https://github.com/KierenP/Halogen-Networks/releases/download/ed164cf2/ed164cf2.nn" \
+        -o ../build/ed164cf2.nn
+
+      ls -lh ../build/ed164cf2.nn
+
+  # ------------------------------------------------------------
+  # Initialize Halogen's flags stamp.
+  #
+  # The actual verbatim executable is supplied by the host-side
+  # AArch64/QEMU step below. Creating the stamp first prevents
+  # Make from rebuilding that executable with the Android linker.
+  # ------------------------------------------------------------
+  - name: Initialize Halogen build configuration
+    working-directory: src
+    shell: bash
+    run: |
+      make release \
+        ARCH=neon-dotprod \
+        CXX="$ANDROID_CLANG" \
+        EVALFILE="../build/ed164cf2.nn" \
+        EXTRA_CXXFLAGS="-mcpu=cortex-a76" \
+        EXTRA_LDFLAGS="-static-libstdc++" \
+        EXE=../bin/Halogen-Android \
+        -n
+
+  # ------------------------------------------------------------
+  # Build Halogen's network-verbatim tool for AArch64 Linux.
+  #
+  # It uses the SAME:
+  #   USE_NEON
+  #   USE_NEON_DOTPROD
+  #   ARMv8.2-A + DotProd
+  #
+  # configuration as the final engine.
+  # ------------------------------------------------------------
+  - name: Build ARM64 network preprocessing tool
+    working-directory: src
+    shell: bash
+    run: |
+      mkdir -p ../build/neon-dotprod
+
+      aarch64-linux-gnu-g++ \
+        -O3 \
+        -std=c++20 \
+        -fno-exceptions \
+        -pthread \
+        -I. \
+        -DUSE_NEON \
+        -DUSE_NEON_DOTPROD \
+        -march=armv8.2-a+dotprod \
+        tools/verbatim.cpp \
+        -o ../build/neon-dotprod/verbatim \
+        -lm
+
+      file ../build/neon-dotprod/verbatim
+
+  # ------------------------------------------------------------
+  # Run the ARM64 tool under QEMU.
+  #
+  # This generates the architecture-specific NNUE layout that
+  # Halogen expects for NEON/DotProd.
+  # ------------------------------------------------------------
+  - name: Generate NEON DotProd NNUE data
+    working-directory: src
+    shell: bash
+    run: |
+      chmod +x ../build/neon-dotprod/verbatim
+
+      qemu-aarch64 \
+        -L /usr/aarch64-linux-gnu \
+        ../build/neon-dotprod/verbatim \
+        ../build/ed164cf2.nn \
+        ../build/neon-dotprod/verbatim.nn
+
+      ls -lh ../build/neon-dotprod/verbatim.nn
+
+  # ------------------------------------------------------------
+  # Build the actual Android engine.
+  #
+  # Important:
+  #   ARCH=neon-dotprod
+  #   -O3
+  #   -flto
+  #   -march=armv8.2-a+dotprod
+  #   -mcpu=cortex-a76
+  #
+  # Halogen's release target supplies O3 + LTO itself.
+  # ------------------------------------------------------------
+  - name: Build Android engine
+    working-directory: src
+    shell: bash
+    run: |
+      make release \
+        ARCH=neon-dotprod \
+        CXX="$ANDROID_CLANG" \
+        EVALFILE="../build/ed164cf2.nn" \
+        EXTRA_CXXFLAGS="-mcpu=cortex-a76" \
+        EXTRA_LDFLAGS="-static-libstdc++" \
+        EXE=../bin/Halogen-Android \
+        -j"$(nproc)"
+
+  # ------------------------------------------------------------
+  # Basic binary verification
+  # ------------------------------------------------------------
+  - name: Verify Android binary
+    shell: bash
+    run: |
+      file bin/Halogen-Android
+
+      readelf -h bin/Halogen-Android | grep -E \
+        "Class:|Machine:"
+
+      ls -lh bin/Halogen-Android
+
+  # ------------------------------------------------------------
+  # Upload binary
+  # ------------------------------------------------------------
+  - name: Upload Android engine
+    uses: actions/upload-artifact@v4
+    with:
+      name: Halogen-Android-ARM64-NEON-DotProd
+      path: bin/Halogen-Android
+      if-no-files-found: error
