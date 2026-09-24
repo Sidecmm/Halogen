@@ -14,24 +14,23 @@ jobs:
     timeout-minutes: 30
 
     steps:
-
-      # ============================================================
-      # CHECKOUT
-      # ============================================================
-
+      # ------------------------------------------------------------
+      # 1. Checkout
+      # ------------------------------------------------------------
       - name: Checkout
         uses: actions/checkout@v4
 
-
-      # ============================================================
-      # ANDROID SDK / NDK
-      # ============================================================
-
+      # ------------------------------------------------------------
+      # 2. Android SDK
+      # ------------------------------------------------------------
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
         with:
           packages: ''
 
+      # ------------------------------------------------------------
+      # 3. Android NDK
+      # ------------------------------------------------------------
       - name: Install Android NDK
         shell: bash
         run: |
@@ -43,13 +42,13 @@ jobs:
             "build-tools;35.0.0" \
             "ndk;27.2.12479018"
 
-
-      # ============================================================
-      # HOST AARCH64 COMPILER + QEMU
+      # ------------------------------------------------------------
+      # 4. Linux AArch64 compiler + QEMU
       #
-      # Used for the Halogen verbatim network preprocessing tool.
-      # ============================================================
-
+      # We need a Linux ARM64 version of Halogen's "verbatim"
+      # tool because the normal Android version cannot execute
+      # on the GitHub Actions Linux host.
+      # ------------------------------------------------------------
       - name: Install AArch64 compiler and QEMU
         shell: bash
         run: |
@@ -65,11 +64,9 @@ jobs:
           echo "QEMU:"
           which qemu-aarch64-static
 
-
-      # ============================================================
-      # ANDROID TOOLCHAIN
-      # ============================================================
-
+      # ------------------------------------------------------------
+      # 5. Configure Android toolchain
+      # ------------------------------------------------------------
       - name: Configure Android toolchain
         shell: bash
         run: |
@@ -79,11 +76,13 @@ jobs:
 
           echo "ANDROID_CLANG=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++" >> "$GITHUB_ENV"
 
+          echo "NDK: $NDK"
+          echo "Android compiler:"
+          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++" --version
 
-      # ============================================================
-      # DOWNLOAD HALOGEN NETWORK
-      # ============================================================
-
+      # ------------------------------------------------------------
+      # 6. Download Halogen network
+      # ------------------------------------------------------------
       - name: Download Halogen network
         shell: bash
         run: |
@@ -96,25 +95,23 @@ jobs:
           echo "Downloaded network:"
           ls -lh build/ed164cf2.nn
 
-
-      # ============================================================
-      # PREPARE DIRECTORIES
-      # ============================================================
-
+      # ------------------------------------------------------------
+      # 7. Prepare directories
+      # ------------------------------------------------------------
       - name: Prepare build directories
         shell: bash
         run: |
           mkdir -p build/neon-dotprod
           mkdir -p bin
 
-
-      # ============================================================
-      # ANDROID MEMORY ALLOCATION FIX
+      # ------------------------------------------------------------
+      # 8. Fix Android aligned allocation
       #
-      # std::aligned_alloc is not usable with this Android NDK/API
-      # combination, so Android uses posix_memalign instead.
-      # ============================================================
-
+      # Android NDK API 24 does not provide the std::aligned_alloc
+      # implementation expected by Halogen's huge_pages.h.
+      #
+      # Use posix_memalign on Android.
+      # ------------------------------------------------------------
       - name: Patch Android memory allocation
         working-directory: src
         shell: bash
@@ -125,6 +122,7 @@ jobs:
           path = Path("utility/huge_pages.h")
           text = path.read_text()
 
+          # Make sure <cstdlib> is available.
           if "#include <cstdlib>" not in text:
               if "#include <cstddef>" in text:
                   text = text.replace(
@@ -153,10 +151,8 @@ jobs:
           if old in text:
               text = text.replace(old, new, 1)
               print("Patched std::aligned_alloc for Android.")
-
           elif "posix_memalign(&aligned_ptr" in text:
               print("Android allocation patch already present.")
-
           else:
               raise SystemExit(
                   "ERROR: Could not find std::aligned_alloc "
@@ -166,23 +162,20 @@ jobs:
           path.write_text(text)
           PY
 
-          echo "----- huge_pages.h -----"
-
+          echo "---- Allocation code ----"
           grep -n -A18 -B8 \
             "aligned_alloc\|posix_memalign" \
             utility/huge_pages.h
 
-
-      # ============================================================
-      # BUILD LINUX AARCH64 VERBATIM
+      # ------------------------------------------------------------
+      # 9. Build Linux ARM64 version of verbatim
       #
       # IMPORTANT:
+      # This is NOT the Android binary.
       #
-      # This is NOT the final Android engine.
-      #
-      # It is the ARM64 Linux helper used to generate verbatim.nn.
-      # ============================================================
-
+      # It is a Linux AArch64 executable that QEMU can execute
+      # on the GitHub Actions x86_64 runner.
+      # ------------------------------------------------------------
       - name: Build ARM64 Linux verbatim
         working-directory: src
         shell: bash
@@ -205,62 +198,49 @@ jobs:
 
           chmod +x ../build/neon-dotprod/verbatim
 
-          echo "----- Linux ARM64 verbatim -----"
-
+          echo "---- verbatim binary ----"
           file ../build/neon-dotprod/verbatim
 
-
-      # ============================================================
-      # GENERATE ARCHITECTURE-SPECIFIC NETWORK
-      #
-      # Run the Linux ARM64 helper under QEMU.
-      # ============================================================
-
+      # ------------------------------------------------------------
+      # 10. Generate verbatim.nn under QEMU
+      # ------------------------------------------------------------
       - name: Generate NEON DotProd network
         working-directory: src
         shell: bash
         run: |
+          echo "Generating verbatim.nn..."
+
           qemu-aarch64-static \
             -L /usr/aarch64-linux-gnu \
             ../build/neon-dotprod/verbatim \
             ../build/ed164cf2.nn \
             ../build/neon-dotprod/verbatim.nn
 
-          echo "----- Generated network -----"
-
+          echo "---- Generated network ----"
           ls -lh ../build/neon-dotprod/verbatim.nn
 
-
-      # ============================================================
-      # VERIFY NETWORK
-      # ============================================================
-
+      # ------------------------------------------------------------
+      # 11. Verify network
+      # ------------------------------------------------------------
       - name: Verify generated network
         shell: bash
         run: |
           test -s build/neon-dotprod/verbatim.nn
 
-          echo "verbatim.nn exists and is non-empty."
-
+          echo "verbatim.nn successfully generated:"
           ls -lh build/neon-dotprod/verbatim.nn
 
-
-      # ============================================================
-      # PATCH HALOGEN MAKEFILE
+      # ------------------------------------------------------------
+      # 12. Disable Makefile's automatic verbatim generation
       #
-      # The original Makefile contains:
+      # This is the critical fix.
       #
-      # $(VERBATIM_NET): $(VERBATIM) $(EVALFILE) $(FLAGS_STAMP)
-      #     ./$(VERBATIM) $(EVALFILE) $@
+      # Normally Makefile does:
       #
-      # That causes make release to build an Android verbatim
-      # executable and then try to execute it on the Linux runner.
+      #   Android verbatim -> execute verbatim -> linker64 error
       #
-      # We already generated the correct ARM64 verbatim.nn above.
-      #
-      # Replace that rule with a simple existence check.
-      # ============================================================
-
+      # We instead use the Linux ARM64/QEMU-generated network.
+      # ------------------------------------------------------------
       - name: Disable automatic verbatim regeneration
         shell: bash
         run: |
@@ -270,19 +250,25 @@ jobs:
           path = Path("src/Makefile")
           text = path.read_text()
 
-          old = """$(VERBATIM_NET): $(VERBATIM) $(EVALFILE) $(FLAGS_STAMP)
-\t./$(VERBATIM) $(EVALFILE) $@"""
+          old = (
+              "$(VERBATIM_NET): $(VERBATIM) $(EVALFILE) $(FLAGS_STAMP)\n"
+              "\t./$(VERBATIM) $(EVALFILE) $@"
+          )
 
-          new = """$(VERBATIM_NET):
-\t@test -s $@ || (echo "ERROR: pre-generated verbatim.nn is missing."; exit 1)
-\t@echo "Using pre-generated $@""""
+          new = (
+              "$(VERBATIM_NET):\n"
+              "\t@test -s $@ || (echo \"ERROR: pre-generated verbatim.nn is missing.\"; exit 1)\n"
+              "\t@echo \"Using pre-generated $@\""
+          )
 
           if old in text:
               text = text.replace(old, new, 1)
               path.write_text(text)
               print("SUCCESS: Makefile verbatim generation disabled.")
+
           elif "Using pre-generated $@" in text:
               print("Makefile patch already present.")
+
           else:
               raise SystemExit(
                   "ERROR: Could not find the expected VERBATIM_NET rule "
@@ -290,33 +276,18 @@ jobs:
               )
           PY
 
-          echo
-          echo "----- Patched Makefile network section -----"
-
+          echo "---- Patched Makefile ----"
           sed -n '340,365p' src/Makefile
 
-
-      # ============================================================
-      # BUILD FINAL ANDROID ENGINE
-      #
-      # This is the REAL engine.
-      #
-      # ARCH:
-      #   neon-dotprod
-      #
-      # CPU:
-      #   Cortex-A76
-      #
-      # Optimizations:
-      #   -O3
-      #   -flto
-      #   ARMv8.2-A DotProd
-      # ============================================================
-
+      # ------------------------------------------------------------
+      # 13. Build Android ARM64 NEON + DotProd engine
+      # ------------------------------------------------------------
       - name: Build Android engine
         working-directory: src
         shell: bash
         run: |
+          echo "Building Halogen for Android ARM64 NEON DotProd..."
+
           make release \
             ARCH=neon-dotprod \
             CXX="$ANDROID_CLANG" \
@@ -326,36 +297,35 @@ jobs:
             EXE=../bin/Halogen-Android \
             -j"$(nproc)"
 
-
-      # ============================================================
-      # VERIFY FINAL BINARY
-      # ============================================================
-
+      # ------------------------------------------------------------
+      # 14. Verify resulting binary
+      # ------------------------------------------------------------
       - name: Verify Android binary
         shell: bash
         run: |
-          echo "========================================"
-          echo "Halogen Android ARM64"
-          echo "========================================"
+          echo "---- Binary information ----"
 
           file bin/Halogen-Android
 
           echo
-          echo "----- ELF header -----"
+          echo "---- ELF header ----"
 
           readelf -h bin/Halogen-Android | grep -E \
             "Class:|Machine:|Type:"
 
           echo
-          echo "----- Binary size -----"
+          echo "---- Binary size ----"
 
           ls -lh bin/Halogen-Android
 
+          echo
+          echo "---- Architecture ----"
 
-      # ============================================================
-      # UPLOAD
-      # ============================================================
+          readelf -A bin/Halogen-Android || true
 
+      # ------------------------------------------------------------
+      # 15. Upload engine
+      # ------------------------------------------------------------
       - name: Upload Android engine
         uses: actions/upload-artifact@v4
         with:
