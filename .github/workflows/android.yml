@@ -14,12 +14,15 @@ jobs:
     timeout-minutes: 30
 
     steps:
+      # =========================================================
+      # SOURCE
+      # =========================================================
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ---------------------------------------------------------
-      # Android SDK / NDK
-      # ---------------------------------------------------------
+      # =========================================================
+      # ANDROID SDK / NDK
+      # =========================================================
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
         with:
@@ -28,39 +31,53 @@ jobs:
       - name: Install Android NDK
         shell: bash
         run: |
+          yes | sdkmanager --licenses >/dev/null || true
+
           sdkmanager --install \
             "platform-tools" \
             "platforms;android-24" \
             "build-tools;35.0.0" \
             "ndk;27.2.12479018"
 
-      # ---------------------------------------------------------
-      # Host tools required to build/run the ARM64 verbatim tool
-      # ---------------------------------------------------------
+      # =========================================================
+      # HOST TOOLS
+      #
+      # Halogen's verbatim program includes arm_neon.h.
+      # Therefore it must be compiled with an AArch64 compiler,
+      # not the normal x86-64 g++.
+      #
+      # It is then executed through QEMU.
+      # =========================================================
       - name: Install AArch64 compiler and QEMU
         shell: bash
         run: |
           sudo apt-get update
+
           sudo apt-get install -y \
             g++-aarch64-linux-gnu \
             qemu-user-static
 
+          echo "AArch64 compiler:"
           which aarch64-linux-gnu-g++
+
+          echo "QEMU:"
           which qemu-aarch64-static
 
-      # ---------------------------------------------------------
-      # Android compiler
-      # ---------------------------------------------------------
+      # =========================================================
+      # ANDROID TOOLCHAIN
+      # =========================================================
       - name: Configure Android toolchain
         shell: bash
         run: |
-          echo "ANDROID_NDK=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+          NDK="$ANDROID_HOME/ndk/27.2.12479018"
 
-          echo "ANDROID_CLANG=$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK=$NDK" >> "$GITHUB_ENV"
 
-      # ---------------------------------------------------------
-      # Download NNUE
-      # ---------------------------------------------------------
+          echo "ANDROID_CLANG=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++" >> "$GITHUB_ENV"
+
+      # =========================================================
+      # NETWORK
+      # =========================================================
       - name: Download Halogen network
         shell: bash
         run: |
@@ -70,44 +87,92 @@ jobs:
             "https://github.com/KierenP/Halogen-Networks/releases/download/ed164cf2/ed164cf2.nn" \
             -o build/ed164cf2.nn
 
+          echo "Downloaded network:"
           ls -lh build/ed164cf2.nn
 
-      # ---------------------------------------------------------
-      # Create the architecture build directory
-      # ---------------------------------------------------------
+      # =========================================================
+      # DIRECTORIES
+      # =========================================================
       - name: Prepare build directories
         shell: bash
         run: |
           mkdir -p build/neon-dotprod
           mkdir -p bin
 
-      # ---------------------------------------------------------
-      # Initialize Halogen's flags stamp.
+      # =========================================================
+      # ANDROID COMPATIBILITY PATCH
       #
-      # This is important because Makefile makes verbatim depend
-      # on flags.stamp.
-      # ---------------------------------------------------------
-      - name: Initialize Halogen build configuration
+      # Android API 24 does not expose std::aligned_alloc in
+      # libc++ in the same way as desktop Linux.
+      #
+      # Halogen's huge_pages.h therefore uses posix_memalign()
+      # when __ANDROID__ is defined.
+      # =========================================================
+      - name: Patch Android memory allocation
         working-directory: src
         shell: bash
         run: |
-          make release \
-            ARCH=neon-dotprod \
-            CXX="$ANDROID_CLANG" \
-            EVALFILE="../build/ed164cf2.nn" \
-            EXTRA_CXXFLAGS="-mcpu=cortex-a76" \
-            EXTRA_LDFLAGS="-static-libstdc++" \
-            EXE=../bin/Halogen-Android \
-            -n
+          python3 - <<'PY'
+          from pathlib import Path
 
-      # ---------------------------------------------------------
-      # Build Halogen's verbatim tool for ARM64 Linux.
+          path = Path("utility/huge_pages.h")
+          text = path.read_text()
+
+          # Add cstdlib if it isn't already present.
+          if "#include <cstdlib>" not in text:
+              if "#include <cstddef>" in text:
+                  text = text.replace(
+                      "#include <cstddef>",
+                      "#include <cstddef>\n#include <cstdlib>",
+                      1
+                  )
+              else:
+                  text = "#include <cstdlib>\n" + text
+
+          # We only patch the std::aligned_alloc expression.
+          #
+          # Android provides posix_memalign(), and this preserves
+          # the required alignment without changing Halogen's
+          # transposition-table architecture.
+          old = """T* data = static_cast<T*>(std::aligned_alloc(huge_page_size, size));"""
+
+          new = """#ifdef __ANDROID__
+    void* aligned_ptr = nullptr;
+
+    if (posix_memalign(&aligned_ptr, huge_page_size, size) != 0)
+        return nullptr;
+
+    T* data = static_cast<T*>(aligned_ptr);
+#else
+    T* data = static_cast<T*>(std::aligned_alloc(huge_page_size, size));
+#endif"""
+
+          if old in text:
+              text = text.replace(old, new, 1)
+              print("Patched std::aligned_alloc for Android.")
+          elif "posix_memalign(&aligned_ptr" in text:
+              print("Android aligned allocation patch already present.")
+          else:
+              raise SystemExit(
+                  "ERROR: Could not find the expected aligned_alloc line "
+                  "in utility/huge_pages.h"
+              )
+
+          path.write_text(text)
+          PY
+
+          echo
+          echo "===== patched huge_pages.h ====="
+          grep -n -A18 -B8 "aligned_alloc\|posix_memalign" utility/huge_pages.h
+
+      # =========================================================
+      # BUILD ARM64 VERBATIM TOOL
       #
-      # DO NOT use normal g++ here.
+      # This is a Linux AArch64 HOST utility, NOT the Android
+      # engine.
       #
-      # USE_NEON requires arm_neon.h, so this must be compiled
-      # with an AArch64 compiler.
-      # ---------------------------------------------------------
+      # It needs arm_neon.h, hence aarch64-linux-gnu-g++.
+      # =========================================================
       - name: Build ARM64 verbatim tool
         working-directory: src
         shell: bash
@@ -125,14 +190,18 @@ jobs:
             -o ../build/neon-dotprod/verbatim \
             -lm
 
+          echo
+          echo "===== verbatim binary ====="
           file ../build/neon-dotprod/verbatim
 
-      # ---------------------------------------------------------
-      # Generate the ARM NEON/DotProd network.
+      # =========================================================
+      # GENERATE NEON/DOTPROD NNUE
       #
-      # Ubuntu runner is x86-64, so execute ARM64 Linux binary
-      # using qemu-aarch64-static.
-      # ---------------------------------------------------------
+      # GitHub runner = x86-64
+      # verbatim       = ARM64 Linux
+      #
+      # Therefore QEMU executes it.
+      # =========================================================
       - name: Generate NEON DotProd network
         working-directory: src
         shell: bash
@@ -145,22 +214,40 @@ jobs:
             ../build/ed164cf2.nn \
             ../build/neon-dotprod/verbatim.nn
 
+          echo
+          echo "===== generated network ====="
           ls -lh ../build/neon-dotprod/verbatim.nn
 
-      # ---------------------------------------------------------
-      # Make sure our prebuilt verbatim files are newer than
-      # flags.stamp so Make does NOT rebuild verbatim using the
-      # Android compiler.
-      # ---------------------------------------------------------
-      - name: Protect prebuilt verbatim tool
+      # =========================================================
+      # PREPARE MAKE
+      #
+      # Halogen's Makefile normally wants to build its own
+      # verbatim executable. We already built it correctly for
+      # ARM64 Linux, so make must see our copy as up-to-date.
+      # =========================================================
+      - name: Prepare Halogen verbatim files
         shell: bash
         run: |
           touch build/neon-dotprod/verbatim
           touch build/neon-dotprod/verbatim.nn
 
-      # ---------------------------------------------------------
-      # Build Android engine
-      # ---------------------------------------------------------
+          echo "===== Halogen build files ====="
+          ls -lh build/neon-dotprod/verbatim
+          ls -lh build/neon-dotprod/verbatim.nn
+
+      # =========================================================
+      # BUILD ANDROID ENGINE
+      #
+      # Halogen's own ARCH=neon-dotprod target provides:
+      #
+      #   USE_NEON
+      #   USE_NEON_DOTPROD
+      #   armv8.2-a+dotprod
+      #   -O3
+      #   -flto
+      #
+      # We additionally tune the compiler for Cortex-A76.
+      # =========================================================
       - name: Build Android engine
         working-directory: src
         shell: bash
@@ -169,28 +256,32 @@ jobs:
             ARCH=neon-dotprod \
             CXX="$ANDROID_CLANG" \
             EVALFILE="../build/ed164cf2.nn" \
-            VERBATIM="../build/neon-dotprod/verbatim" \
             EXTRA_CXXFLAGS="-mcpu=cortex-a76" \
             EXTRA_LDFLAGS="-static-libstdc++" \
             EXE=../bin/Halogen-Android \
             -j"$(nproc)"
 
-      # ---------------------------------------------------------
-      # Verify
-      # ---------------------------------------------------------
+      # =========================================================
+      # VERIFY
+      # =========================================================
       - name: Verify Android binary
         shell: bash
         run: |
+          echo "===== file ====="
           file bin/Halogen-Android
 
+          echo
+          echo "===== ELF ====="
           readelf -h bin/Halogen-Android | grep -E \
             "Class:|Machine:"
 
+          echo
+          echo "===== size ====="
           ls -lh bin/Halogen-Android
 
-      # ---------------------------------------------------------
-      # Upload
-      # ---------------------------------------------------------
+      # =========================================================
+      # ARTIFACT
+      # =========================================================
       - name: Upload Android engine
         uses: actions/upload-artifact@v4
         with:
